@@ -12,9 +12,20 @@
 //      "BadJwtType: Invalid jwt type \"at+jwt\"" -- confirmed empirically.
 //      Cross-service calls need a token from com.atproto.server.getServiceAuth,
 //      scoped to a specific aud (Ozone's DID) and lxm (the exact method).
-//      These default to a 60s expiry, so a fresh one is minted at the start
-//      of every cycle here rather than cached/reused across cycles --
-//      simplest thing that can't go stale mid-batch.
+//      A fresh one is minted at the start of every cycle, requesting a 300s
+//      expiry -- but that request is apparently not honored as-is: in
+//      production, a large batch (thousands of URIs) started hitting
+//      "JwtExpired" 401s well before 300s had elapsed, silently dropping
+//      every label after the token died (confirmed: 6,679 lost labels in
+//      under 20 minutes before this was caught via `journalctl -u
+//      ozone-bridge`). The exact cause wasn't tracked down (the lexicon
+//      itself warns "the service may enforce certain time bounds on tokens
+//      depending on the requested scope"), but the fix doesn't need to know
+//      why: emitLabelEvent() now retries once with a freshly-minted token on
+//      any 401, so an expiring token degrades to "one extra HTTP round trip"
+//      instead of "every remaining label in this cycle is lost forever" (the
+//      cycle's byteOffset is saved *before* the emit loop runs, so anything
+//      that fails outright here never gets a second chance on a later cycle).
 //   2. A real `cid`, not just a `uri`. Ozone validates request bodies against
 //      the lexicon, and com.atproto.repo.strongRef marks cid as required --
 //      confirmed empirically (a strongRef without cid is rejected with 400
@@ -106,7 +117,11 @@ async function emitLabelEvent(serviceJwt, uri, cid, labels) {
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${serviceJwt}` },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`emitEvent failed for ${uri}: ${res.status} ${await res.text()}`);
+  if (!res.ok) {
+    const err = new Error(`emitEvent failed for ${uri}: ${res.status} ${await res.text()}`);
+    err.status = res.status;
+    throw err;
+  }
 }
 
 async function loadOffset() {
@@ -178,22 +193,40 @@ async function ingestNewLines() {
       return;
     }
 
-    const serviceJwt = await getServiceAuthToken();
+    let serviceJwt = await getServiceAuthToken();
     let emitted = 0;
     let failed = 0;
+    let tokenRefreshes = 0;
     for (const [uri, { cid, labels }] of byUri) {
       try {
         await emitLabelEvent(serviceJwt, uri, cid, [...labels]);
         emitted += labels.size;
       } catch (err) {
+        if (err.status === 401) {
+          // token died mid-batch -- mint a fresh one and retry this URI
+          // once before giving up on it. Without this, everything after
+          // the first expiry in a cycle was silently lost (see the header
+          // comment) since a failed emit here never gets revisited later.
+          tokenRefreshes++;
+          try {
+            serviceJwt = await getServiceAuthToken();
+            await emitLabelEvent(serviceJwt, uri, cid, [...labels]);
+            emitted += labels.size;
+            continue;
+          } catch (retryErr) {
+            console.error(`emitEvent retry-after-refresh also failed: ${retryErr.message}`);
+          }
+        } else {
+          console.error(`emitEvent error: ${err.message}`);
+        }
         failed++;
-        console.error(`emitEvent error: ${err.message}`);
       }
     }
     console.log(
       `[${new Date().toISOString()}] emitted ${emitted} labels across ${byUri.size} URIs` +
         (skippedNoCid > 0 ? ` (skipped ${skippedNoCid} rows with no cid)` : "") +
         (failed > 0 ? ` (${failed} URIs failed)` : "") +
+        (tokenRefreshes > 0 ? ` (${tokenRefreshes} token refresh(es) mid-cycle)` : "") +
         ` (byte offset ${byteOffset})`,
     );
   } finally {

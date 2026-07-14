@@ -330,6 +330,16 @@ One wire-format difference noted for anyone building tooling that inspects raw s
 
 While testing the ingester's `cid` capture, chased a real "why does `posts.jsonl` keep growing after I killed the ingester" mystery for several steps before finding **two separate orphaned `ingester.main` processes** left over from earlier `timeout N cmd | tail ...` and backgrounded (`cmd & PID=$!`) test invocations — piping into `tail` can prevent a `timeout`'s SIGTERM from reaching the intended process cleanly, and `$!` capture can grab the wrong PID when a command is embedded in a larger `eval`'d string. `pgrep -af <pattern>` before concluding "nothing is producing this" would have caught it immediately — worth doing by habit before chasing a more exotic explanation.
 
+### A production bug found by actually checking the logs, not just "is the process up": service-auth tokens expiring mid-batch silently dropped labels
+
+Once the full pipeline was running for real (not just the small hand-crafted test from the section above), `journalctl -u ozone-bridge` showed **6,679 `JwtExpired` 401s in under 20 minutes** — every single one of those was a permanently lost label, not a retry, because `byteOffset` is saved *before* the emit loop runs each cycle (a deliberate choice for crash-safety, see the byte-offset design elsewhere in this doc) — so a failed `emitEvent` call never gets a second chance on a later cycle.
+
+Root cause: `getServiceAuthToken()` requests a 300s expiry, but a single cycle's batch (thousands of URIs when there's real backlog) apparently took long enough — or the requested `exp` wasn't honored as asked — that the token died partway through. The lexicon itself hints at this: `getServiceAuth`'s `exp` param docs say "the service may enforce certain time bounds on tokens depending on the requested scope," i.e. don't assume you get what you ask for. The exact mechanism wasn't tracked down — didn't need to be, since the fix doesn't depend on knowing why.
+
+**Fix:** `emitLabelEvent`'s call site now catches a 401 specifically (checked via an `err.status` property set on throw, not string-matching the message), mints one fresh service-auth token, and retries that single URI once before giving up on it. This turns "every remaining label in the cycle after the first expiry is lost" into "one extra HTTP round trip when a token happens to die mid-batch" — correct regardless of whether the root cause is batch duration, a server-side cap, or something else entirely.
+
+**General lesson, worth repeating:** "the process is running and the health check returns 200" is not the same as "it's actually working correctly." This bug was invisible from `tools/status.py` and even from `queryLabels` spot-checks (which only show what *did* land, never what silently didn't) — it only surfaced by deliberately grepping the service's own log for error-shaped lines. Any future "let's check how X is behaving" pass on a long-running service should include an actual `journalctl -u <service> | grep -i error` sweep, not just a process/backlog status check.
+
 ---
 
 ## Status tool (`tools/status.py`)
