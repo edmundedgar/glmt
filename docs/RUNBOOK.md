@@ -133,13 +133,25 @@ python -m classifier.local_llm_bulk_label --limit 500     # cap new posts this i
 
 ## 8. Live pipeline: classify continuously and serve real labels
 
-Three long-running processes, meant to run concurrently (all resumable — safe to kill and restart independently):
+Three long-running processes, meant to run concurrently (all resumable — safe to kill and restart independently). All three have both silently died at least once with nothing running to notice or restart them, so all three have systemd units (`deploy/*.service`) with `Restart=always` — this is the recommended way to run them:
+
+```bash
+sudo cp deploy/ingester.service deploy/live-export.service deploy/labeler-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ingester live-export labeler-server
+sudo systemctl status ingester live-export labeler-server
+journalctl -u ingester -u live-export -u labeler-server -f
+```
+
+Manual/foreground equivalents, if you don't want the systemd units installed:
 
 ```bash
 python -m ingester.main                    # firehose -> data/posts.jsonl
 python -m classifier.live_export_labels    # posts.jsonl -> labeler/pending-labels.jsonl, polls every 10s
-./labeler/run_supervised.sh                # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels -- has a known leak, run supervised (see section 9)
+./labeler/run_supervised.sh                # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels -- has a known leak (see NOTES.md), don't run this one bare
 ```
+
+Note `local_llm_bulk_label.py` (section 7) deliberately does **not** have a systemd unit — you want manual control over when it runs so it can yield the GPU to other work, and `Restart=always` would fight that.
 
 (There's also `classifier/export_labels.py --limit 2000`, a one-shot batch version that samples `posts.jsonl` instead of tailing it continuously — useful for a quick backfill or a one-off check, not for ongoing serving.)
 

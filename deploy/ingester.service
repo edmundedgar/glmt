@@ -1,0 +1,21 @@
+[Unit]
+Description=Bluesky firehose ingester -- writes posts to data/posts.jsonl
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glmt
+WorkingDirectory=/home/glmt/glmt
+ExecStart=/home/glmt/glmt/.venv/bin/python -m ingester.main
+
+# Resumable via data/cursor.txt (a Jetstream time_us position, independent
+# of the output file) -- safe to restart any time, resumes ~5s before
+# where it left off. This has silently died before with nothing running
+# to restart it (found hours later via tools/status.py); Restart=always
+# turns that into a brief automatic recovery instead.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

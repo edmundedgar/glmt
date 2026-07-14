@@ -1,0 +1,20 @@
+[Unit]
+Description=Live classifier export -- classifies data/posts.jsonl, writes labeler/pending-labels.jsonl
+After=network.target
+
+[Service]
+Type=simple
+User=glmt
+WorkingDirectory=/home/glmt/glmt
+ExecStart=/home/glmt/glmt/.venv/bin/python -m classifier.live_export_labels
+
+# Resumable via data/live_export_cursor.txt (a byte offset into posts.jsonl,
+# with shrink-detection so a rotation doesn't break it -- see NOTES.md).
+# Safe to restart any time. Restart=always for the same reason as
+# ingester.service: this has silently died before with nothing running to
+# restart it.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
