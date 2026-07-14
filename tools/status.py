@@ -26,8 +26,7 @@ ARCHIVE_DIR = DATA_DIR / "archive"
 ROTATE_LOG_PATH = DATA_DIR / "rotate_posts.log"
 
 PENDING_LABELS_PATH = LABELER_DIR / "pending-labels.jsonl"
-INGEST_OFFSET_PATH = LABELER_DIR / ".ingest-offset"
-LABELS_DB_PATH = LABELER_DIR / "labels.db"
+OZONE_BRIDGE_OFFSET_PATH = LABELER_DIR / ".ozone-ingest-offset"
 
 CAUGHT_UP_MARGIN_BYTES = 20 * 1024 * 1024  # matches ingester/rotate_posts.py
 STALL_WARNING_SECONDS = 5 * 60
@@ -105,7 +104,8 @@ def report_processes() -> None:
         ("Ingester (firehose -> posts.jsonl)", "ingester.main", ("python",)),
         ("Live classifier export", "classifier.live_export_labels", ("python",)),
         ("Bulk labeler (Ollama)", "classifier.local_llm_bulk_label", ("python",)),
-        ("Labeler server", "server.mjs", ("node",)),
+        ("Ozone (labeler server)", "enable-source-maps api.ts", ("node",)),
+        ("Ozone bridge", "ozone_bridge.mjs", ("node",)),
     ]
     for label, pattern, comms in checks:
         proc = find_process(pattern, comms)
@@ -224,7 +224,7 @@ def main() -> None:
     report_processes()
     report_ingester()
     report_backlog("Live classifier export (posts.jsonl -> pending-labels.jsonl)", LIVE_EXPORT_CURSOR_PATH, POSTS_PATH)
-    report_backlog("Labeler server ingest (pending-labels.jsonl -> labels.db)", INGEST_OFFSET_PATH, PENDING_LABELS_PATH)
+    report_backlog("Ozone bridge (pending-labels.jsonl -> Ozone via emitEvent)", OZONE_BRIDGE_OFFSET_PATH, PENDING_LABELS_PATH)
     report_bulk_labeler()
     report_rotation()
     report_gpu()

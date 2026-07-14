@@ -8,4 +8,5 @@ dependencies = [
     "torch>=2.13",
     "transformers>=5.13",
     "anthropic>=0.116",
+    "psycopg[binary]>=3.2",
 ]

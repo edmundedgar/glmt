@@ -133,14 +133,14 @@ python -m classifier.local_llm_bulk_label --limit 500     # cap new posts this i
 
 ## 8. Live pipeline: classify continuously and serve real labels
 
-Three long-running processes, meant to run concurrently (all resumable — safe to kill and restart independently). All three have both silently died at least once with nothing running to notice or restart them, so all three have systemd units (`deploy/*.service`) with `Restart=always` — this is the recommended way to run them:
+Four long-running processes, meant to run concurrently (all resumable — safe to kill and restart independently). Several have silently died at least once with nothing running to notice or restart them, so all four have systemd units (`deploy/*.service`) with `Restart=always` — this is the recommended way to run them:
 
 ```bash
-sudo cp deploy/ingester.service deploy/live-export.service deploy/labeler-server.service /etc/systemd/system/
+sudo cp deploy/ingester.service deploy/live-export.service deploy/ozone.service deploy/ozone-bridge.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now ingester live-export labeler-server
-sudo systemctl status ingester live-export labeler-server
-journalctl -u ingester -u live-export -u labeler-server -f
+sudo systemctl enable --now ingester live-export ozone ozone-bridge
+sudo systemctl status ingester live-export ozone ozone-bridge
+journalctl -u ingester -u live-export -u ozone -u ozone-bridge -f
 ```
 
 Manual/foreground equivalents, if you don't want the systemd units installed:
@@ -148,16 +148,75 @@ Manual/foreground equivalents, if you don't want the systemd units installed:
 ```bash
 python -m ingester.main                    # firehose -> data/posts.jsonl
 python -m classifier.live_export_labels    # posts.jsonl -> labeler/pending-labels.jsonl, polls every 10s
-./labeler/run_supervised.sh                # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels -- has a known leak (see NOTES.md), don't run this one bare
+node --env-file=.env services/ozone/api.ts # (from ozone-src/services/ozone) -- signs and serves queryLabels/subscribeLabels
+node --env-file=../.env ozone_bridge.mjs   # (from labeler/) -- pending-labels.jsonl -> Ozone via emitEvent, polls every 10s
 ```
 
 Note `local_llm_bulk_label.py` (section 7) deliberately does **not** have a systemd unit — you want manual control over when it runs so it can yield the GPU to other work, and `Restart=always` would fight that.
 
 (There's also `classifier/export_labels.py --limit 2000`, a one-shot batch version that samples `posts.jsonl` instead of tailing it continuously — useful for a quick backfill or a one-off check, not for ongoing serving.)
 
-`live_export_labels.py` tracks its own cursor (`data/live_export_cursor.txt`, separate from the ingester's) as a **byte offset** into `posts.jsonl`, and processes new lines in bounded chunks (`MAX_LINES_PER_CYCLE = 5000`) rather than reading the whole file every cycle — see NOTES.md if touching this, it OOM'd once before the bounded-chunk cap was added. `server.mjs` tracks a byte offset into `pending-labels.jsonl` (`labeler/.ingest-offset`) the same way. Both detect the file shrinking (truncated/rotated) and resync from the start instead of breaking — this makes it safe to eventually rotate/prune `posts.jsonl` (currently unbounded-growth, gigabytes and counting) without having to coordinate a cursor reset by hand.
+`live_export_labels.py` tracks its own cursor (`data/live_export_cursor.txt`, separate from the ingester's) as a **byte offset** into `posts.jsonl`, and processes new lines in bounded chunks (`MAX_LINES_PER_CYCLE = 5000`) rather than reading the whole file every cycle — see NOTES.md if touching this, it OOM'd once before the bounded-chunk cap was added. `ozone_bridge.mjs` tracks a byte offset into `pending-labels.jsonl` (`labeler/.ozone-ingest-offset`) the same way. Both detect the file shrinking (truncated/rotated) and resync from the start instead of breaking — this makes it safe to eventually rotate/prune `posts.jsonl` (currently unbounded-growth, gigabytes and counting) without having to coordinate a cursor reset by hand.
 
-## 9. Labeler server setup (one-time, `labeler/`)
+## 9. Ozone setup (current labeler backend)
+
+Ozone (`bluesky-social/atproto`'s production moderation/labeler service) replaced `@skyware/labeler` as the labeler backend — see NOTES.md for why (unmaintained, unresolved memory leak). Built from source; no Docker available on this box.
+
+**One-time setup:**
+
+```bash
+git clone --depth 1 https://github.com/bluesky-social/atproto.git /home/glmt/ozone-src   # OUTSIDE the repo, not a submodule
+cd /home/glmt/ozone-src
+corepack enable && corepack prepare pnpm@11.11.0 --activate
+PUPPETEER_SKIP_DOWNLOAD=true pnpm install --frozen-lockfile
+pnpm run --recursive --stream --filter '@atproto/aws...' --filter '@atproto/ozone...' build
+```
+
+**Database** (Postgres already installed on this box, role `glmt` has superuser — no sudo needed):
+
+```bash
+psql -U glmt -d postgres -c "CREATE DATABASE ozone OWNER glmt;"
+psql -U glmt -d postgres -c "ALTER ROLE glmt WITH PASSWORD '<generate one>';"   # TCP connections need password auth, unlike the local peer-auth socket
+```
+
+**Config** (`/home/glmt/ozone-src/services/ozone/.env`, gitignored by virtue of living outside the repo):
+
+```
+OZONE_PORT=14831
+OZONE_PUBLIC_URL=https://label.goat.navy
+OZONE_SERVER_DID=<same LABELLER_DID as the rest of the project -- no new identity needed>
+OZONE_DB_POSTGRES_URL=postgresql://glmt:<password>@127.0.0.1:5432/ozone
+OZONE_DB_MIGRATE=1
+OZONE_APPVIEW_URL=https://api.bsky.app
+OZONE_APPVIEW_DID=did:web:api.bsky.app
+OZONE_DID_PLC_URL=https://plc.directory
+OZONE_ADMIN_PASSWORD=<generate one -- this is Ozone's own admin console password, unrelated to the bsky account password>
+OZONE_SIGNING_KEY_HEX=<same LABELLER_SIGNING_KEY as the rest of the project>
+OZONE_ADMIN_DIDS=<same LABELLER_DID>
+```
+
+Reuses the existing labeler identity end to end — same DID, same signing key already registered on its `#atproto_label` verification method. `OZONE_DB_MIGRATE=1` runs all pending migrations on every startup (idempotent, cheap once caught up — no separate migration step needed). Port matches what the tunnel/nginx already forward (see `deploy/README.md`), so nothing on that side needed to change when switching from `server.mjs`.
+
+**Run:** `node --env-file=.env --enable-source-maps api.ts` from `services/ozone/` (real entrypoint — package.json's own `"start"` script points at a `dist/bin.js` that doesn't actually exist in this repo, don't use it).
+
+## 10. Ozone bridge (`labeler/ozone_bridge.mjs`)
+
+Ozone has no equivalent of `@skyware/labeler`'s `createLabels()` — every label goes through authenticated `tools.ozone.moderation.emitEvent`. Two non-obvious requirements this surfaced, both confirmed empirically against the real server, not assumed:
+
+1. **Service-auth, not a session token.** A plain `com.atproto.server.createSession` access token gets rejected (`BadJwtType`). Needs a token from `com.atproto.server.getServiceAuth` scoped to `aud=<Ozone's DID>` and `lxm=tools.ozone.moderation.emitEvent` — the bridge mints a fresh one (5 min expiry) at the start of every poll cycle rather than trying to cache/refresh across cycles.
+2. **A real `cid`, not just a `uri`.** `com.atproto.repo.strongRef` (the subject shape for labeling a specific post) marks `cid` as required, and Ozone validates request bodies strictly — a strongRef without one is rejected with 400. This is why `ingester/main.py` now captures `cid` from Jetstream commit events (previously discarded) and `live_export_labels.py` propagates it through to `pending-labels.jsonl`. Rows written before this change (or by anything that hasn't picked it up yet) have `"cid": null`; the bridge skips those rather than fetching the CID on demand (an extra network round-trip per post, and the post may no longer exist by then) — logged as a skip count, not silently dropped.
+
+```bash
+node --env-file=../.env ozone_bridge.mjs    # from labeler/
+```
+
+Needs `LABELLER_DID` and `APP_PASSWORD` in `.env` (the same account credentials used for the earlier `declare-labels.mjs`/`verify-signing-key.mjs` setup). Resolves the account's PDS from its DID document at startup, logs in once, and re-logs-in automatically on a 401 from an expired session.
+
+For serving this publicly from a second box during development, see `deploy/README.md`.
+
+## 11. Labeler server setup — `@skyware/labeler` (historical, no longer the active backend)
+
+Superseded by Ozone (section 9) — kept here in case of a future rollback. `server.mjs` still exists and works; nothing about it broke, it was replaced because the library itself is archived/unmaintained and has an unresolved memory leak (see NOTES.md).
 
 ```bash
 cd labeler
@@ -192,35 +251,17 @@ node --env-file=../.env verify-signing-key.mjs "at://did:plc:.../app.bsky.feed.p
 
 Derives the pubkey from `.env`, compares it against the did:plc document's `#atproto_label` verification method (**not** `#atproto` — that's the account's regular PDS/repo key, a separate keypair), and checks a real label's signature from `queryLabels` against both. All three should agree.
 
-**Then run the server** (see section 8 above): `node --env-file=.env labeler/server.mjs` — listens on port 14831, ingests `pending-labels.jsonl` into its own SQLite (`labeler/labels.db`, gitignored, owned entirely by `@skyware/labeler` — no external DB hookup, see NOTES.md).
+**Run:** `node --env-file=.env labeler/server.mjs` — listens on port 14831, ingests `pending-labels.jsonl` into its own SQLite (`labeler/labels.db`, gitignored, owned entirely by `@skyware/labeler` — no external DB hookup, see NOTES.md). **Run it supervised, not bare** (`./labeler/run_supervised.sh` or `deploy/labeler-server.service`) — it has a known unresolved memory leak (see NOTES.md).
 
-**Run it supervised, not bare — it has a known unresolved memory leak** (see NOTES.md's "A second, deeper server.mjs memory leak" section) that eventually OOM-crashes it under sustained load. Two options:
-
-```bash
-# No sudo needed, immediate:
-./labeler/run_supervised.sh
-
-# Or, proper process supervision (needs sudo once, to install):
-sudo cp deploy/labeler-server.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now labeler-server.service
-sudo systemctl status labeler-server
-journalctl -u labeler-server -f
-```
-
-Either way, a crash means a few seconds of downtime and an automatic restart, not silent extended downtime (which happened for real before this existed).
-
-For serving this publicly from a second box during development, see `deploy/README.md`.
-
-## 10. Check overall status
+## 12. Check overall status
 
 ```bash
 python -m tools.status
 ```
 
-One-shot report: which of the 4 long-running processes (ingester, live classifier export, bulk labeler, labeler server) are actually up, the SSH tunnel's systemd state, the ingester's firehose lag, how far behind each downstream stage's cursor is from its input file (posts.jsonl → pending-labels.jsonl → labels.db), the bulk labeler's row count and last-write freshness (flags if the process is running but hasn't written anything in 5+ minutes — this exact symptom was a real Ollama hang once), rotation cron/archive state, and GPU memory/utilization. No daemon, stdlib only, safe to run any time.
+One-shot report: which of the 5 long-running processes (ingester, live classifier export, bulk labeler, Ozone, Ozone bridge) are actually up, the SSH tunnel's systemd state, the ingester's firehose lag, how far behind each downstream stage's cursor is from its input file (posts.jsonl → pending-labels.jsonl → Ozone), the bulk labeler's row count and last-write freshness (flags if the process is running but hasn't written anything in 5+ minutes — this exact symptom was a real Ollama hang once), rotation cron/archive state, and GPU memory/utilization. No daemon, stdlib only, safe to run any time.
 
-## 11. Query what's actually been labeled
+## 13. Query what's actually been labeled
 
 ```bash
 python -m tools.query_labels                              # label frequency summary, all time
@@ -230,7 +271,7 @@ python -m tools.query_labels --label uspol                 # most recent posts l
 python -m tools.query_labels --label uspol --recent 50 --since 6
 ```
 
-Queries `labeler/labels.db` directly (read-only) — this is the actual label store (`@skyware/labeler`'s own SQLite), **not Postgres**, which is installed on this box but holds nothing (see NOTES.md's "Labeler server" section for why). Schema is one table: `labels(id, src, uri, cid, val, neg, cts, exp, sig)`.
+Queries Ozone's `label` table in Postgres directly (reads the connection string from `/home/glmt/ozone-src/services/ozone/.env`, the same DB Ozone itself uses). Schema: `label(id, src, uri, cid, val, neg, cts, exp, sig, signingKeyId)`. (Historical note: before the Ozone migration this queried `labeler/labels.db`, `@skyware/labeler`'s own SQLite — see NOTES.md if that file still exists and you're not sure which is current.)
 
 ---
 

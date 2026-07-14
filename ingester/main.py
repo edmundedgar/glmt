@@ -14,6 +14,12 @@ DATA_DIR = Path(__file__).parent.parent / "data"
 CURSOR_PATH = DATA_DIR / "cursor.txt"
 OUTPUT_PATH = DATA_DIR / "posts.jsonl"
 
+# cid is required to build a com.atproto.repo.strongRef when labeling a
+# specific post via Ozone's emitEvent (the lexicon marks it required, and
+# Ozone validates request bodies strictly -- confirmed empirically, a
+# strongRef without cid is rejected with 400 InvalidRequest). Jetstream
+# commit events already carry it; previously it was silently discarded.
+
 
 class CursorTracker:
     """Shared holder for the most recent event's time_us, so the consumer
@@ -38,8 +44,9 @@ async def produce(client: JetstreamClient, batcher: Batcher, cursor: CursorTrack
         if not text:
             continue
         uri = f"at://{event['did']}/app.bsky.feed.post/{commit['rkey']}"
+        cid = commit.get("cid")
         cursor.latest_time_us = event["time_us"]
-        await batcher.add((uri, text))
+        await batcher.add((uri, text, cid))
 
 
 async def consume(queue: asyncio.Queue, client: JetstreamClient, cursor: CursorTracker) -> None:
@@ -47,8 +54,8 @@ async def consume(queue: asyncio.Queue, client: JetstreamClient, cursor: CursorT
     with open(OUTPUT_PATH, "a") as f:
         while True:
             batch = await queue.get()
-            for uri, text in batch:
-                f.write(json.dumps({"uri": uri, "text": text}) + "\n")
+            for uri, text, cid in batch:
+                f.write(json.dumps({"uri": uri, "text": text, "cid": cid}) + "\n")
             f.flush()
             if cursor.latest_time_us is not None:
                 client.save_cursor(cursor.latest_time_us)

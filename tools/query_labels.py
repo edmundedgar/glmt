@@ -1,6 +1,9 @@
-"""Query labeler/labels.db -- the actual label store (@skyware/labeler's
-own SQLite, see docs/NOTES.md's "Labeler server" section). Postgres is
-installed on this box but unused; nothing lives there.
+"""Query Ozone's Postgres `label` table -- the actual label store since the
+migration off @skyware/labeler (see docs/NOTES.md's "Migrating from
+@skyware/labeler to Ozone" section). Reads the connection string straight
+out of Ozone's own .env (outside this repo, at
+/home/glmt/ozone-src/services/ozone/.env) rather than duplicating
+credentials in a second place.
 
 Usage:
     python -m tools.query_labels                        # label frequency summary, all time
@@ -11,27 +14,33 @@ Usage:
 """
 
 import argparse
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "labeler" / "labels.db"
+import psycopg
+
+OZONE_ENV_PATH = Path("/home/glmt/ozone-src/services/ozone/.env")
 
 
-def connect() -> sqlite3.Connection:
-    if not DB_PATH.exists():
-        raise SystemExit(f"{DB_PATH} doesn't exist -- has the labeler server run yet?")
-    return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
+def read_db_url() -> str:
+    if not OZONE_ENV_PATH.exists():
+        raise SystemExit(f"{OZONE_ENV_PATH} doesn't exist -- is Ozone set up? See docs/RUNBOOK.md section 9.")
+    for line in OZONE_ENV_PATH.read_text().splitlines():
+        if line.startswith("OZONE_DB_POSTGRES_URL="):
+            return line.split("=", 1)[1].strip()
+    raise SystemExit(f"OZONE_DB_POSTGRES_URL not found in {OZONE_ENV_PATH}")
+
+
+def connect() -> psycopg.Connection:
+    return psycopg.connect(read_db_url())
 
 
 def cutoff_str(hours: float) -> str:
-    """cts is stored as '2026-07-14T09:00:12.190Z' -- SQLite's own
-    datetime('now', ...) produces a differently-formatted string
-    ('2026-07-14 09:00:15', space-separated, no millis/Z) that silently
-    fails to compare correctly against it as text (confirmed empirically:
-    a naive `cts >= datetime('now', '-1 hours')` returned the same count
-    for a 1-hour and a 24-hour window). Building the cutoff in the same
-    format as the stored column sidesteps the whole problem."""
+    """cts is stored as '2026-07-14T09:00:12.190Z' (character varying, not
+    a real timestamp type) -- match that exact format so a plain text >=
+    comparison works. See the SQLite version of this script (git history)
+    for why this matters: a naively-formatted cutoff can silently compare
+    wrong and make every window return the same (wrong) count."""
     dt = datetime.now(timezone.utc) - timedelta(hours=hours)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
@@ -51,11 +60,11 @@ def to_bsky_link(uri: str) -> str | None:
     return f"https://bsky.app/profile/{did}/post/{rkey}"
 
 
-def show_summary(conn: sqlite3.Connection, since_hours: float | None) -> None:
+def show_summary(conn: psycopg.Connection, since_hours: float | None) -> None:
     where, params = "", ()
     if since_hours is not None:
-        where, params = "WHERE cts >= ?", (cutoff_str(since_hours),)
-    rows = conn.execute(f"SELECT val, COUNT(*) FROM labels {where} GROUP BY val ORDER BY COUNT(*) DESC", params).fetchall()
+        where, params = "WHERE cts >= %s", (cutoff_str(since_hours),)
+    rows = conn.execute(f"SELECT val, COUNT(*) FROM label {where} GROUP BY val ORDER BY COUNT(*) DESC", params).fetchall()
     window = "all time" if since_hours is None else f"last {since_hours}h"
     print(f"label counts ({window}):")
     for val, count in rows:
@@ -63,8 +72,8 @@ def show_summary(conn: sqlite3.Connection, since_hours: float | None) -> None:
     print(f"  {sum(c for _, c in rows):>8}  TOTAL")
 
 
-def show_for_uri(conn: sqlite3.Connection, uri: str) -> None:
-    rows = conn.execute("SELECT val, neg, cts FROM labels WHERE uri = ? ORDER BY cts", (uri,)).fetchall()
+def show_for_uri(conn: psycopg.Connection, uri: str) -> None:
+    rows = conn.execute("SELECT val, neg, cts FROM label WHERE uri = %s ORDER BY cts", (uri,)).fetchall()
     if not rows:
         print(f"no labels found for {uri}")
         return
@@ -74,12 +83,12 @@ def show_for_uri(conn: sqlite3.Connection, uri: str) -> None:
         print(f"  {'NEGATED ' if neg else ''}{val}  ({cts})")
 
 
-def show_recent_for_label(conn: sqlite3.Connection, label: str, limit: int, since_hours: float | None) -> None:
-    where, params = "WHERE val = ?", [label]
+def show_recent_for_label(conn: psycopg.Connection, label: str, limit: int, since_hours: float | None) -> None:
+    where, params = "WHERE val = %s", [label]
     if since_hours is not None:
-        where += " AND cts >= ?"
+        where += " AND cts >= %s"
         params.append(cutoff_str(since_hours))
-    rows = conn.execute(f"SELECT uri, cts FROM labels {where} ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
+    rows = conn.execute(f"SELECT uri, cts FROM label {where} ORDER BY id DESC LIMIT %s", (*params, limit)).fetchall()
     if not rows:
         print(f"no labels found for {label!r}")
         return

@@ -10,4 +10,5 @@ classifier/weights_backup*/
 labeler/node_modules/
 labeler/labels.db*
 labeler/.ingest-offset*
+labeler/.ozone-ingest-offset*
 labeler/pending-labels.jsonl

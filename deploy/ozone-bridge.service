@@ -1,0 +1,16 @@
+[Unit]
+Description=Bridges classifier/live_export_labels.py output into Ozone via emitEvent
+After=network.target ozone.service
+Wants=ozone.service
+
+[Service]
+Type=simple
+User=glmt
+WorkingDirectory=/home/glmt/glmt/labeler
+ExecStart=/home/glmt/.nvm/versions/node/v24.18.0/bin/node --env-file=/home/glmt/glmt/.env ozone_bridge.mjs
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

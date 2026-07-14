@@ -122,7 +122,16 @@ def main() -> None:
                 for j, post in enumerate(batch):
                     for k, topic in enumerate(TOPICS):
                         if probs[j, k].item() > THRESHOLD:
-                            row = {"uri": post["uri"], "label": topic, "confidence": round(probs[j, k].item(), 3)}
+                            # cid may be absent on rows written before the ingester
+                            # started capturing it -- pass through as-is (null),
+                            # consumers that need a strongRef (e.g. the Ozone
+                            # bridge) skip rows without one rather than guessing.
+                            row = {
+                                "uri": post["uri"],
+                                "cid": post.get("cid"),
+                                "label": topic,
+                                "confidence": round(probs[j, k].item(), 3),
+                            }
                             out_f.write(json.dumps(row) + "\n")
                             out_f.flush()
                             found += 1

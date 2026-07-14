@@ -1,0 +1,23 @@
+[Unit]
+Description=Ozone (bluesky-social/atproto moderation/labeler service) -- signs and serves queryLabels/subscribeLabels
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=glmt
+WorkingDirectory=/home/glmt/ozone-src/services/ozone
+ExecStart=/home/glmt/.nvm/versions/node/v24.18.0/bin/node --env-file=.env --enable-source-maps api.ts
+
+Restart=always
+RestartSec=5
+
+# No known leak here (unlike the old skyware-based labeler-server.service),
+# but a generous hard cap is cheap insurance given this box has already hit
+# real memory pressure once from an unrelated process -- see NOTES.md.
+# Higher than labeler-server's 2G since Ozone is a heavier, more legitimate
+# service (Postgres connection pools, full moderation feature set).
+MemoryMax=4G
+
+[Install]
+WantedBy=multi-user.target

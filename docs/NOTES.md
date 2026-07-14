@@ -295,6 +295,43 @@ Runs daily via cron at 3am (`crontab -e`) rather than a size threshold — simpl
 
 ---
 
+## Migrating from `@skyware/labeler` to Ozone
+
+Switched labeler backends: `@skyware/labeler` is archived (read-only on GitHub as of Feb 2026) and had the unresolved memory leak documented above. Ozone (`bluesky-social/atproto`'s own production moderation/labeler service) is actively maintained, heavily tested, and built for exactly the scale problem we were hitting (Postgres-backed, not a single SQLite file).
+
+### Finding the real entrypoint took more digging than expected
+
+`packages/ozone/package.json`'s own `"start": "node --enable-source-maps dist/bin.js"` script is stale/unused — `src/bin.ts` doesn't exist anywhere in the repo. The actual entrypoint, confirmed via `services/ozone/Dockerfile`'s `CMD`, is `services/ozone/api.ts` (a separate top-level `services/` directory, not `packages/`), run as `node --enable-source-maps --import=./tracer.ts api.ts` — the `tracer.ts` import is Datadog tracing setup, skippable for local/dev use. **Lesson: for a real monorepo, trust the Dockerfile's `CMD` over a package's own `package.json` scripts** — the latter can go stale in ways that only show up as a confusing 404 on `src/bin.ts` when you actually try to build.
+
+### Build: Node 24.18 + pnpm 11.11.0, filtered build, no Docker needed
+
+Cloned shallow (`--depth 1`) **outside the project repo** (`/home/glmt/ozone-src`, a sibling of `glmt/`, not nested inside it — cloning it nested once by mistake, caught before it was ever staged). `corepack prepare pnpm@11.11.0 --activate` matches the exact version pinned in the Dockerfile; Node 24.18 (already installed via nvm for the rest of this project) matches the Dockerfile's base image exactly, no separate install needed. `pnpm run --recursive --stream --filter '@atproto/aws...' --filter '@atproto/ozone...' build` builds only what's actually needed rather than the whole monorepo — full `pnpm install` + this filtered build together took well under a minute.
+
+### Config: reused the existing labeler identity, no new PLC identity needed
+
+`OZONE_SERVER_DID` and `OZONE_SIGNING_KEY_HEX` are set to the *same* DID and signing key already registered on the `#atproto_label` verification method from the `@skyware/labeler` setup. Ozone doesn't care which library wrote that DID document entry — it just needs a valid secp256k1 key that matches it. This meant zero identity migration: same `did:plc:...`, same public-facing account, same tunnel/nginx config (`OZONE_PORT=14831` was chosen specifically to match what the tunnel already forwards, avoiding any change on that side). `OZONE_APPVIEW_URL`/`OZONE_APPVIEW_DID` were resolved from the real `https://api.bsky.app/.well-known/did.json` rather than assumed (`did:web:api.bsky.app`) — worth re-verifying if this is ever revisited, since AppView infrastructure can change.
+
+Local Postgres: the `glmt` role already existed (superuser, from earlier in this project) and could `CREATE DATABASE ozone` directly, no `sudo` needed. TCP connections (what Node's `pg` driver uses) need password auth even though local Unix-socket `psql` connections work passwordlessly via peer auth — had to `ALTER ROLE glmt WITH PASSWORD ...` before `postgresql://glmt:...@127.0.0.1:5432/ozone` would connect.
+
+### emitEvent requires two things `@skyware/labeler` never needed
+
+Both confirmed empirically against the real running server, not assumed from docs:
+
+1. **Service-auth, not a session token.** Calling `tools.ozone.moderation.emitEvent` with a plain `com.atproto.server.createSession` access token gets rejected: `{"error":"BadJwtType","message":"Invalid jwt type \"at+jwt\""}`. Cross-service XRPC calls need a token from `com.atproto.server.getServiceAuth?aud=<target DID>&lxm=<method>` instead — a short-lived (60s default, configurable via an `exp` param) token scoped to exactly that audience+method pair. `labeler/ozone_bridge.mjs` mints a fresh one at the start of every poll cycle rather than trying to cache and refresh one across cycles — simplest thing that can't go stale mid-batch, and the extra HTTP call per 10s cycle is negligible overhead.
+2. **A real `cid`, not just a `uri`.** Labeling a specific post requires a `com.atproto.repo.strongRef` subject (`{uri, cid}`), and the lexicon marks `cid` required — confirmed by testing a strongRef without one: `{"error":"InvalidRequest","message":"Input/subject must have the property \"cid\""}`. `@skyware/labeler`'s `createLabels()` never needed this (it only used `uri`+optional `cid` internally, never validated). This meant `cid` had to be threaded through the whole pipeline: Jetstream commit events already carry it (`commit.cid`, sibling to `commit.rkey`) but `ingester/main.py` was silently discarding it; now captured and written to `posts.jsonl`, then propagated through `live_export_labels.py` into `pending-labels.jsonl`. Rows from before this change have `"cid": null` — `ozone_bridge.mjs` skips those (logs a skip count) rather than fetching the CID on demand per post, which would add a network round-trip per label and could hit posts already deleted by the time it got there.
+
+### Verified end-to-end before trusting it, same discipline as everything else in this project
+
+Full chain tested with real data, not just "the server starts": authenticated as the real account → minted a service-auth token → called `emitEvent` with a real `strongRef` → pulled the label back via `queryLabels` → cryptographically verified its signature against the known pubkey (valid) → confirmed `subscribeLabels` streams it over a real WebSocket, both locally and through the public tunnel (`https://label.goat.navy`, forcing `--http1.1` in curl since HTTP/2-over-TLS doesn't do old-style `Connection: Upgrade` — a client-side testing artifact, not a real server problem, real WS clients negotiate this correctly on their own).
+
+One wire-format difference noted for anyone building tooling that inspects raw signed labels from both systems: Ozone omits `neg` from the signed dag-cbor payload when `false`; `@skyware/labeler` always included it explicitly (`neg: !!label.neg`). Confirmed by testing both variants against a real Ozone-issued signature — only the omit-when-false version verified.
+
+### Testing gotcha: watch for orphaned background processes from your own test invocations
+
+While testing the ingester's `cid` capture, chased a real "why does `posts.jsonl` keep growing after I killed the ingester" mystery for several steps before finding **two separate orphaned `ingester.main` processes** left over from earlier `timeout N cmd | tail ...` and backgrounded (`cmd & PID=$!`) test invocations — piping into `tail` can prevent a `timeout`'s SIGTERM from reaching the intended process cleanly, and `$!` capture can grab the wrong PID when a command is embedded in a larger `eval`'d string. `pgrep -af <pattern>` before concluding "nothing is producing this" would have caught it immediately — worth doing by habit before chasing a more exotic explanation.
+
+---
+
 ## Status tool (`tools/status.py`)
 
 One-shot report covering all the state scattered across this session's notes: which long-running processes are actually alive, the ingester's firehose lag, each downstream cursor's backlog against its input file, the bulk labeler's row count and write-freshness, rotation/archive state, GPU usage. Stdlib-only, no daemon.
