@@ -31,6 +31,18 @@ python -m ingester.main
 
 Runs until killed; appends preprocessed `(uri, text)` pairs to `data/posts.jsonl` and persists resume state to `data/cursor.txt`. Safe to stop/restart — it resumes ~5s before where it left off. If restarted after a long gap, expect a fast "catch-up" burst before it settles into live real-time rate (~40-60 posts/sec for `app.bsky.feed.post` creates).
 
+**`posts.jsonl` rotation.** Left alone, this file grows forever (already 1GB+). A cron job (installed via `crontab -e`, runs daily at 3am) handles this automatically:
+
+```
+0 3 * * * cd /home/glmt/glmt && .venv/bin/python -m ingester.rotate_posts >> data/rotate_posts.log 2>&1
+```
+
+(cron jobs start in `$HOME`, not the repo root, so the `cd` is required — a bare relative path here fails silently into the wrong directory.)
+
+`ingester/rotate_posts.py` only rotates once `classifier/live_export_labels.py`'s cursor is caught up to within ~20MB of `posts.jsonl`'s current size — otherwise it skips that day entirely rather than risk archiving away posts nothing has processed yet. When it does rotate: stops the ingester, renames `posts.jsonl` aside, restarts the ingester (fresh empty file, firehose resumes from its own saved cursor), then compresses the rotated file into `data/archive/posts-<timestamp>.jsonl.gz` and prunes archives older than 14 days. Safe to run manually any time: `python -m ingester.rotate_posts` (add `--dry-run` to just see whether it would rotate, without doing anything).
+
+`data/rotate_posts.log` (from the cron redirect) and `data/ingester.log` (the restarted ingester's own stdout/stderr) are both useful for checking a rotation actually happened correctly.
+
 ## 2. Classifier baseline (no training required)
 
 ```bash
