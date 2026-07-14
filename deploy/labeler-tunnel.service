@@ -1,0 +1,25 @@
+[Unit]
+Description=Reverse SSH tunnel to o1.edochan.com for the labeler server (dev/build-phase only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=glmt
+Environment=AUTOSSH_GATETIME=0
+# AUTOSSH_GATETIME=0: don't wait before deciding a connection is stable;
+# retry immediately on failure even if it never successfully connected once.
+
+ExecStart=/usr/bin/autossh -M 0 -N \
+  -o "ServerAliveInterval 30" \
+  -o "ServerAliveCountMax 3" \
+  -o "ExitOnForwardFailure yes" \
+  -o "StrictHostKeyChecking accept-new" \
+  -R 127.0.0.1:14831:127.0.0.1:14831 \
+  gmlt@o1.edochan.com
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
