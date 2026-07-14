@@ -36,6 +36,21 @@ def cutoff_str(hours: float) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+def to_bsky_link(uri: str) -> str | None:
+    """at://{did}/app.bsky.feed.post/{rkey} -> https://bsky.app/profile/{did}/post/{rkey}.
+    The DID works directly in the URL, no handle resolution needed.
+    Returns None for anything that isn't a feed-post URI (nothing else
+    lands in this table today, but don't guess a URL shape for a
+    collection this wasn't written for)."""
+    if not uri.startswith("at://"):
+        return None
+    parts = uri[len("at://") :].split("/")
+    if len(parts) != 3 or parts[1] != "app.bsky.feed.post":
+        return None
+    did, _, rkey = parts
+    return f"https://bsky.app/profile/{did}/post/{rkey}"
+
+
 def show_summary(conn: sqlite3.Connection, since_hours: float | None) -> None:
     where, params = "", ()
     if since_hours is not None:
@@ -53,7 +68,8 @@ def show_for_uri(conn: sqlite3.Connection, uri: str) -> None:
     if not rows:
         print(f"no labels found for {uri}")
         return
-    print(f"labels for {uri}:")
+    link = to_bsky_link(uri)
+    print(f"labels for {uri}:" + (f"\n  ({link})" if link else ""))
     for val, neg, cts in rows:
         print(f"  {'NEGATED ' if neg else ''}{val}  ({cts})")
 
@@ -69,7 +85,8 @@ def show_recent_for_label(conn: sqlite3.Connection, label: str, limit: int, sinc
         return
     print(f"{len(rows)} most recent {label!r} label(s):")
     for uri, cts in rows:
-        print(f"  {cts}  {uri}")
+        link = to_bsky_link(uri)
+        print(f"  {cts}  {link or uri}")
 
 
 def main() -> None:
