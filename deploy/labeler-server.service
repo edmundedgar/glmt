@@ -6,6 +6,7 @@ After=network.target
 Type=simple
 User=glmt
 WorkingDirectory=/home/glmt/glmt/labeler
+Environment=NODE_OPTIONS=--max-old-space-size=1536
 ExecStart=/home/glmt/.nvm/versions/node/v24.18.0/bin/node --env-file=/home/glmt/glmt/.env server.mjs
 
 # There's a known, not-yet-root-caused memory leak that eventually OOM-crashes
@@ -15,6 +16,25 @@ ExecStart=/home/glmt/.nvm/versions/node/v24.18.0/bin/node --env-file=/home/glmt/
 # unit existed) into "brief automatic restart" -- a mitigation, not a fix.
 Restart=always
 RestartSec=5
+
+# Hard memory ceiling, enforced by the kernel via cgroups -- without this,
+# nothing stops the leak from growing into a system-wide OOM situation
+# where the kernel's OOM killer can pick ANY process on the box as its
+# victim, not necessarily this one (confirmed: this box was already under
+# real memory pressure -- 1.4GB free, 1.1GB swap in use -- while this
+# process alone had grown to 5.9GB RSS in one crash). MemoryMax makes a
+# leak here kill only this process, cleanly, every time.
+#
+# NODE_OPTIONS above caps V8's own JS heap at 1.5GB, below the 2GB
+# MemoryMax -- lets V8 hit its own ceiling and log its usual
+# "JavaScript heap out of memory" FATAL ERROR (visible via `journalctl -u
+# labeler-server`) in the common case, rather than a silent SIGKILL from
+# the cgroup OOM killer with no application-level error message. The
+# MemoryMax is still the real backstop: it also covers whatever native/
+# off-heap memory is growing beyond what NODE_OPTIONS bounds (RSS was
+# observed exceeding the JS heap number by a meaningful margin).
+MemoryMax=2G
+MemorySwapMax=0
 
 [Install]
 WantedBy=multi-user.target
