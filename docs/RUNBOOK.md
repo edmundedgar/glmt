@@ -192,6 +192,18 @@ python -m tools.status
 
 One-shot report: which of the 4 long-running processes (ingester, live classifier export, bulk labeler, labeler server) are actually up, the SSH tunnel's systemd state, the ingester's firehose lag, how far behind each downstream stage's cursor is from its input file (posts.jsonl → pending-labels.jsonl → labels.db), the bulk labeler's row count and last-write freshness (flags if the process is running but hasn't written anything in 5+ minutes — this exact symptom was a real Ollama hang once), rotation cron/archive state, and GPU memory/utilization. No daemon, stdlib only, safe to run any time.
 
+## 11. Query what's actually been labeled
+
+```bash
+python -m tools.query_labels                              # label frequency summary, all time
+python -m tools.query_labels --since 24                    # summary, last 24h only
+python -m tools.query_labels --uri "at://did:plc:.../app.bsky.feed.post/..."
+python -m tools.query_labels --label uspol                 # most recent posts labeled uspol
+python -m tools.query_labels --label uspol --recent 50 --since 6
+```
+
+Queries `labeler/labels.db` directly (read-only) — this is the actual label store (`@skyware/labeler`'s own SQLite), **not Postgres**, which is installed on this box but holds nothing (see NOTES.md's "Labeler server" section for why). Schema is one table: `labels(id, src, uri, cid, val, neg, cts, exp, sig)`.
+
 ---
 
 ## Typical end-to-end flow for a new topic
