@@ -138,7 +138,7 @@ Three long-running processes, meant to run concurrently (all resumable — safe 
 ```bash
 python -m ingester.main                    # firehose -> data/posts.jsonl
 python -m classifier.live_export_labels    # posts.jsonl -> labeler/pending-labels.jsonl, polls every 10s
-node --env-file=.env labeler/server.mjs    # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels
+./labeler/run_supervised.sh                # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels -- has a known leak, run supervised (see section 9)
 ```
 
 (There's also `classifier/export_labels.py --limit 2000`, a one-shot batch version that samples `posts.jsonl` instead of tailing it continuously — useful for a quick backfill or a one-off check, not for ongoing serving.)
@@ -181,6 +181,22 @@ node --env-file=../.env verify-signing-key.mjs "at://did:plc:.../app.bsky.feed.p
 Derives the pubkey from `.env`, compares it against the did:plc document's `#atproto_label` verification method (**not** `#atproto` — that's the account's regular PDS/repo key, a separate keypair), and checks a real label's signature from `queryLabels` against both. All three should agree.
 
 **Then run the server** (see section 8 above): `node --env-file=.env labeler/server.mjs` — listens on port 14831, ingests `pending-labels.jsonl` into its own SQLite (`labeler/labels.db`, gitignored, owned entirely by `@skyware/labeler` — no external DB hookup, see NOTES.md).
+
+**Run it supervised, not bare — it has a known unresolved memory leak** (see NOTES.md's "A second, deeper server.mjs memory leak" section) that eventually OOM-crashes it under sustained load. Two options:
+
+```bash
+# No sudo needed, immediate:
+./labeler/run_supervised.sh
+
+# Or, proper process supervision (needs sudo once, to install):
+sudo cp deploy/labeler-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now labeler-server.service
+sudo systemctl status labeler-server
+journalctl -u labeler-server -f
+```
+
+Either way, a crash means a few seconds of downtime and an automatic restart, not silent extended downtime (which happened for real before this existed).
 
 For serving this publicly from a second box during development, see `deploy/README.md`.
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Bluesky labeler server (@skyware/labeler) -- signs and serves queryLabels/subscribeLabels
+After=network.target
+
+[Service]
+Type=simple
+User=glmt
+WorkingDirectory=/home/glmt/glmt/labeler
+ExecStart=/home/glmt/.nvm/versions/node/v24.18.0/bin/node --env-file=/home/glmt/glmt/.env server.mjs
+
+# There's a known, not-yet-root-caused memory leak that eventually OOM-crashes
+# this process under sustained heavy catch-up load (see the comment at the
+# top of server.mjs). Restart=always turns that from "silently down for
+# hours until someone notices" (which happened for real, twice, before this
+# unit existed) into "brief automatic restart" -- a mitigation, not a fix.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
