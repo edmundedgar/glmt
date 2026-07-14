@@ -269,6 +269,14 @@ Runs daily via cron at 3am (`crontab -e`) rather than a size threshold — simpl
 
 ---
 
+## Status tool (`tools/status.py`)
+
+One-shot report covering all the state scattered across this session's notes: which long-running processes are actually alive, the ingester's firehose lag, each downstream cursor's backlog against its input file, the bulk labeler's row count and write-freshness, rotation/archive state, GPU usage. Stdlib-only, no daemon.
+
+**`ps -o comm=` is not a reliable way to identify a process's interpreter.** The first version of this tool matched processes via `pgrep -f <pattern>` and then filtered by checking `ps -o comm=` for a `python`/`node` prefix, to reject wrapper shells that merely mention the pattern in their own invocation text (a real problem: e.g. `pgrep -f "server.mjs"` also matches a `bash -c '... server.mjs'` launcher wrapper, not just the actual `node server.mjs` process). This silently misidentified the real `server.mjs` process as NOT RUNNING on first use — its `comm` reported as `MainThread`, not `node` (something in its dependency stack, likely libuv or a native addon, calls `prctl`/`pthread_setname_np` and overwrites the kernel-visible process name). Fixed by resolving `/proc/<pid>/exe` instead, which points at the actual binary path regardless of what the process has renamed its `comm` to. **General lesson:** `comm` is a mutable, self-reported label (any process can rename itself); if you need to know what binary a PID actually is, resolve `/proc/<pid>/exe`.
+
+---
+
 ## Data file inventory (`data/`, gitignored)
 
 Everything in `data/` is generated, not source-controlled. Key files, in rough pipeline order:
