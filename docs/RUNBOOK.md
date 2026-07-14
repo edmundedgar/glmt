@@ -131,7 +131,7 @@ node --env-file=.env labeler/server.mjs    # pending-labels.jsonl -> signed labe
 
 (There's also `classifier/export_labels.py --limit 2000`, a one-shot batch version that samples `posts.jsonl` instead of tailing it continuously — useful for a quick backfill or a one-off check, not for ongoing serving.)
 
-`live_export_labels.py` tracks its own cursor (`data/live_export_cursor.txt`, separate from the ingester's) and processes new lines in bounded chunks (`MAX_LINES_PER_CYCLE = 5000`) rather than reading the whole file every cycle — see NOTES.md if touching this, it OOM'd once before this was added. `server.mjs` similarly tracks a byte offset into `pending-labels.jsonl` (`labeler/.ingest-offset`) rather than re-reading the whole file each poll, for the same reason.
+`live_export_labels.py` tracks its own cursor (`data/live_export_cursor.txt`, separate from the ingester's) as a **byte offset** into `posts.jsonl`, and processes new lines in bounded chunks (`MAX_LINES_PER_CYCLE = 5000`) rather than reading the whole file every cycle — see NOTES.md if touching this, it OOM'd once before the bounded-chunk cap was added. `server.mjs` tracks a byte offset into `pending-labels.jsonl` (`labeler/.ingest-offset`) the same way. Both detect the file shrinking (truncated/rotated) and resync from the start instead of breaking — this makes it safe to eventually rotate/prune `posts.jsonl` (currently unbounded-growth, gigabytes and counting) without having to coordinate a cursor reset by hand.
 
 ## 9. Labeler server setup (one-time, `labeler/`)
 

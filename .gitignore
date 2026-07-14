@@ -9,5 +9,5 @@ classifier/weights_backup*/
 *.swp
 labeler/node_modules/
 labeler/labels.db*
-labeler/.ingest-offset
+labeler/.ingest-offset*
 labeler/pending-labels.jsonl

@@ -1,8 +1,12 @@
 """Continuously classify new posts as they're appended to posts.jsonl by
 the ingester, appending (uri, label, confidence) rows to
-labeler/pending-labels.jsonl as they're found. Resumable -- tracks how
-many lines of posts.jsonl have already been processed in a cursor file,
-same pattern as ingester/main.py's own cursor.
+labeler/pending-labels.jsonl as they're found. Resumable -- tracks a byte
+offset into posts.jsonl in a cursor file (same pattern as
+labeler/server.mjs's .ingest-offset), not a line count, so it survives
+posts.jsonl being truncated/rotated later: a shrink is detected and
+triggers a resync from the start rather than silently reading garbage or
+crashing. A line-count cursor can't do this safely -- it has no way to
+tell "the file got smaller" from "we're just early in a fresh file".
 
 Usage:
     python -m classifier.live_export_labels
@@ -25,12 +29,13 @@ TOPICS = ["uspol", "sports", "music", "donald-trump", "gaming", "mental-health",
 THRESHOLD = 0.5
 BATCH_SIZE = 64
 POLL_INTERVAL_SECONDS = 10
-# Cap how many new lines get read (and held in memory) per cycle. Without
-# this, a large backlog (e.g. the ingester running unattended for hours
-# while this was stopped) gets read as ONE unbounded batch -- multi-million
-# posts held in memory at once, no cursor save or output until the whole
-# sweep finishes. This is the same class of bug that OOM-crashed
-# labeler/server.mjs from unbounded growth over a long run.
+# Cap how many lines get parsed (and held in memory) per cycle, independent
+# of the byte-offset cursor above. Without this, a large backlog (e.g. the
+# ingester running unattended for hours while this was stopped) gets read
+# as ONE unbounded batch -- multi-million posts held in memory at once, no
+# cursor save or output until the whole sweep finishes. This is the same
+# class of bug that OOM-crashed labeler/server.mjs from unbounded growth
+# over a long run.
 MAX_LINES_PER_CYCLE = 5000
 
 
@@ -49,18 +54,34 @@ def save_cursor(n: int) -> None:
     tmp.replace(CURSOR_PATH)
 
 
-def read_new_posts(path: Path, start_line: int, max_lines: int) -> tuple[list[dict], int]:
+def read_new_posts(path: Path, byte_offset: int, max_lines: int) -> tuple[list[dict], int]:
+    """Reads up to max_lines complete (newline-terminated) JSON lines
+    starting at byte_offset. A trailing partial line -- the ingester wrote
+    the start of it but hasn't flushed the newline yet -- is left alone
+    rather than parsed early; it'll be complete (or further along) next
+    cycle. Detects the file having shrunk (truncated/rotated/deleted and
+    recreated) and resyncs from the start instead of seeking past EOF."""
     posts = []
-    line_count = start_line
-    with open(path) as f:
-        for i, line in enumerate(f):
-            if i < start_line:
-                continue
-            if len(posts) >= max_lines:
+    try:
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return posts, 0
+
+    if size < byte_offset:
+        print(f"posts.jsonl shrank ({size} < {byte_offset}) -- resyncing from start", flush=True)
+        byte_offset = 0
+    if size <= byte_offset:
+        return posts, byte_offset
+
+    with open(path, "rb") as f:
+        f.seek(byte_offset)
+        while len(posts) < max_lines:
+            line = f.readline()
+            if not line.endswith(b"\n"):
                 break
             posts.append(json.loads(line))
-            line_count = i + 1
-    return posts, line_count
+            byte_offset = f.tell()
+    return posts, byte_offset
 
 
 def main() -> None:
@@ -78,7 +99,7 @@ def main() -> None:
     stacked.eval()
 
     cursor = load_cursor()
-    print(f"starting from line {cursor}")
+    print(f"starting from byte offset {cursor}")
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     while True:
@@ -108,7 +129,7 @@ def main() -> None:
 
         cursor = new_cursor
         save_cursor(cursor)
-        print(f"processed {len(posts)} new posts (line {cursor}), found {found} labels", flush=True)
+        print(f"processed {len(posts)} new posts (byte offset {cursor}), found {found} labels", flush=True)
 
         # A full chunk likely means there's more backlog waiting -- keep
         # going immediately rather than sleeping, so catch-up after a long
