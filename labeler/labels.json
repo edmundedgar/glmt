@@ -1,0 +1,42 @@
+[
+  {
+    "identifier": "uspol",
+    "name": "US Politics",
+    "description": "US politics: content about US political parties, politicians, elections, policy debates, or partisan commentary on US government and current affairs. Does not include politics of other countries unless directly compared to US politics."
+  },
+  {
+    "identifier": "death",
+    "name": "Death",
+    "description": "Content primarily about death, mourning, or mortality."
+  },
+  {
+    "identifier": "sports",
+    "name": "Sports",
+    "description": "Content about organized sports, athletes, teams, games, and sports commentary."
+  },
+  {
+    "identifier": "music",
+    "name": "Music",
+    "description": "Content about musicians, songs, albums, concerts, or music culture and commentary."
+  },
+  {
+    "identifier": "donald-trump",
+    "name": "Donald Trump",
+    "description": "Content specifically about Donald Trump -- his statements, actions, or commentary directly about him."
+  },
+  {
+    "identifier": "gaming",
+    "name": "Gaming",
+    "description": "Content about video games, game culture, esports, or game-related commentary."
+  },
+  {
+    "identifier": "mental-health",
+    "name": "Mental Health",
+    "description": "Content about mental health, emotional wellbeing, therapy, or psychological experiences."
+  },
+  {
+    "identifier": "technology",
+    "name": "Technology",
+    "description": "Content about software, hardware, computing, or the technology industry."
+  }
+]

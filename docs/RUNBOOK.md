@@ -71,6 +71,17 @@ python -m classifier.train --source freeform --topic gaming --data-path data/loc
 
 Trains only the frozen-encoder's per-topic `nn.Linear` head (few seconds on GPU). Saves to `classifier/weights/<topic>.pt` **only if validation F1 > 0.7** — otherwise it prints the metrics and declines to save (per spec).
 
+**Naming quirk:** the currently-deployed political-content head is named `uspol` (matches the label identifier declared in `labeler/labels.json`), but the local-model freeform data tags the same concept `us-politics` (matches the Anthropic freeform pipeline's canonical label). Training against `--topic us-politics` saves to `classifier/weights/us-politics.pt` — copy that over `uspol.pt` to actually deploy it:
+
+```bash
+python -m classifier.train --source freeform --topic us-politics --data-path data/local_llm_bulk_labeled.jsonl
+cp classifier/weights/us-politics.pt classifier/weights/uspol.pt
+```
+
+Every other currently-deployed topic (`sports`, `music`, `donald-trump`, `gaming`, `mental-health`, `technology`) uses the same tag name in both the local-model data and the deployed identifier, so no rename is needed for those.
+
+**Before retraining any deployed head, back up the current weights** (`mkdir -p classifier/weights_backup_<name> && cp classifier/weights/*.pt classifier/weights_backup_<name>/`, then `ls` the backup dir to confirm files actually landed) — `train.py` only overwrites a weight file if the new F1 clears 0.7, but a technically-passing head can still be a regression on data the old one handled well. If you deploy a new head, **restart `live_export_labels.py`** afterward — it loads weights once at startup and won't pick up a change on disk.
+
 ## 5. Evaluate
 
 ```bash
@@ -107,6 +118,59 @@ python -m classifier.local_llm_bulk_label                # runs until posts.json
 python -m classifier.local_llm_bulk_label --limit 500     # cap new posts this invocation
 ```
 → appends to `data/local_llm_bulk_labeled.jsonl`, skips anything already labeled. Safe to `kill -9` and restart any time — verified empirically (see NOTES.md). Feed the growing file into `classifier/train.py --source freeform --data-path data/local_llm_bulk_labeled.jsonl` periodically to retrain.
+
+## 8. Live pipeline: classify continuously and serve real labels
+
+Three long-running processes, meant to run concurrently (all resumable — safe to kill and restart independently):
+
+```bash
+python -m ingester.main                    # firehose -> data/posts.jsonl
+python -m classifier.live_export_labels    # posts.jsonl -> labeler/pending-labels.jsonl, polls every 10s
+node --env-file=.env labeler/server.mjs    # pending-labels.jsonl -> signed labels, serves queryLabels/subscribeLabels
+```
+
+(There's also `classifier/export_labels.py --limit 2000`, a one-shot batch version that samples `posts.jsonl` instead of tailing it continuously — useful for a quick backfill or a one-off check, not for ongoing serving.)
+
+`live_export_labels.py` tracks its own cursor (`data/live_export_cursor.txt`, separate from the ingester's) and processes new lines in bounded chunks (`MAX_LINES_PER_CYCLE = 5000`) rather than reading the whole file every cycle — see NOTES.md if touching this, it OOM'd once before this was added. `server.mjs` similarly tracks a byte offset into `pending-labels.jsonl` (`labeler/.ingest-offset`) rather than re-reading the whole file each poll, for the same reason.
+
+## 9. Labeler server setup (one-time, `labeler/`)
+
+```bash
+cd labeler
+npm install
+```
+
+Needs these in the repo-root `.env` (gitignored):
+
+```
+LABELLER_DID=did:plc:...
+LABELLER_SIGNING_KEY=<secp256k1 private key, hex>
+APP_PASSWORD=<bsky app password, for the account-setup scripts only>
+```
+
+`LABELLER_DID`/`LABELLER_SIGNING_KEY` come from running `npx @skyware/labeler setup` once against the labeler's bsky account (see NOTES.md for why a bsky account is needed at all — short version: `app.bsky.labeler.service` is a PDS-backed repo record, so the labeler needs a PDS, and the easiest way to get one is a regular account). That command also declares the labeler's endpoint and signing key into the account's did:plc document.
+
+**Label taxonomy** (`labeler/labels.json`) is the source of truth for what labels exist. Push it to the account:
+
+```bash
+node --env-file=../.env declare-labels.mjs             # from labeler/
+node --env-file=../.env declare-labels.mjs --dry-run    # preview without pushing
+node --env-file=../.env get-labels.mjs                  # check what's currently declared
+```
+
+Re-run `declare-labels.mjs` (no `--dry-run`) any time labels aren't showing up in a client and you want to force the AppView to re-fetch the declaration — it's cheap and has fixed exactly this before.
+
+**Verify the signing key matches the DID document** (useful if labels aren't verifying/showing up anywhere and you suspect a key mismatch):
+
+```bash
+node --env-file=../.env verify-signing-key.mjs "at://did:plc:.../app.bsky.feed.post/..."
+```
+
+Derives the pubkey from `.env`, compares it against the did:plc document's `#atproto_label` verification method (**not** `#atproto` — that's the account's regular PDS/repo key, a separate keypair), and checks a real label's signature from `queryLabels` against both. All three should agree.
+
+**Then run the server** (see section 8 above): `node --env-file=.env labeler/server.mjs` — listens on port 14831, ingests `pending-labels.jsonl` into its own SQLite (`labeler/labels.db`, gitignored, owned entirely by `@skyware/labeler` — no external DB hookup, see NOTES.md).
+
+For serving this publicly from a second box during development, see `deploy/README.md`.
 
 ---
 

@@ -18,6 +18,14 @@ from pathlib import Path
 OLLAMA_URL = "http://localhost:11434/api/chat"
 DEFAULT_MODEL = "qwen3:14b"
 DATA_PATH = Path(__file__).parent.parent / "data" / "posts.jsonl"
+# The Ollama server here runs with --context-shift, which lets generation
+# keep going past num_ctx by dropping old tokens instead of stopping -- so
+# a degenerate repetition loop on some pathological post has no natural
+# end. num_predict caps output length regardless, and the request timeout
+# is a second line of defense so one bad post can't wedge an unattended
+# bulk-labeling run forever.
+MAX_PREDICT_TOKENS = 512
+REQUEST_TIMEOUT_SECONDS = 60
 
 # Our existing trained topic heads (classifier/weights/*.pt), plus
 # additional well-represented topics pulled from the top-40 canonical
@@ -89,51 +97,38 @@ def load_posts(path: Path, limit: int) -> list[dict]:
     return posts
 
 
-def extract_labels(text: str) -> list[str]:
-    """Without schema-constrained decoding, the model follows the prompt's
-    literal instruction ("return an array") and emits a bare JSON array --
-    not the {"labels": [...]} object our FORMAT_SCHEMA would have forced.
-    Try the array form first (what we observe empirically), fall back to
-    an object with a "labels" key in case a model wraps it differently."""
-    try:
-        start = text.rindex("[")
-        end = text.rindex("]") + 1
-        return json.loads(text[start:end])
-    except ValueError:
-        pass
-    start = text.rindex("{")
-    end = text.rindex("}") + 1
-    return json.loads(text[start:end])["labels"]
-
-
 def classify(model: str, text: str, no_think: bool) -> tuple[list[str], float, str]:
     """Returns (labels, elapsed_seconds, thinking_text). thinking_text is ""
     when no_think=True or the model didn't return one.
 
-    Grammar-constrained decoding (the "format" JSON-schema param) forces the
-    very first generated token to conform to the schema, which suppresses
-    any thinking preamble regardless of /no_think -- confirmed empirically:
-    with "format" set, eval_count stayed ~16 tokens whether /no_think was
-    appended or not. To genuinely test thinking-enabled behavior we drop
-    "format" entirely here and parse the model's natural JSON output instead.
+    Uses Ollama's native "think" API parameter (a proper request-level
+    control), not the Qwen3 "/no_think" prompt-text convention -- that
+    convention turned out to be unreliable in practice: the exact same
+    request (format set, "/no_think" appended) sometimes still produced a
+    full thinking trace and took 10x longer, presumably because a text
+    hint in the prompt is a soft suggestion the model can ignore, not a
+    hard constraint. "think" is a real API field and has been reliable
+    across repeated tests. "format" (structured output) works cleanly
+    together with "think": true or false either way, so there's no need
+    to drop the schema for the thinking-enabled path anymore.
     """
     prompt = PROMPT_TEMPLATE.format(text=text)
-    body_dict = {
-        "model": model,
-        "messages": [{"role": "user", "content": prompt}],
-        "stream": False,
-        "options": {"num_ctx": 4096},
-    }
-    if no_think:
-        body_dict["messages"][0]["content"] += " /no_think"
-        body_dict["format"] = FORMAT_SCHEMA
-    body = json.dumps(body_dict).encode()
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "think": not no_think,
+            "format": FORMAT_SCHEMA,
+            "stream": False,
+            "options": {"num_ctx": 4096, "num_predict": MAX_PREDICT_TOKENS},
+        }
+    ).encode()
     req = urllib.request.Request(OLLAMA_URL, data=body, headers={"Content-Type": "application/json"})
     start = time.perf_counter()
-    with urllib.request.urlopen(req) as resp:
+    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_SECONDS) as resp:
         result = json.loads(resp.read())
     elapsed = time.perf_counter() - start
-    labels = extract_labels(result["message"]["content"])
+    labels = json.loads(result["message"]["content"])["labels"]
     thinking = result["message"].get("thinking", "") or ""
     return labels, elapsed, thinking
 

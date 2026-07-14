@@ -78,7 +78,7 @@ def main() -> None:
                 continue
 
             try:
-                labels, elapsed, thinking = classify(args.model, post["text"], args.no_think)
+                labels, elapsed, _thinking = classify(args.model, post["text"], args.no_think)
             except Exception as e:
                 print(f"error on {post['uri']}: {e}", flush=True)
                 errors += 1
@@ -87,7 +87,7 @@ def main() -> None:
             total_time += elapsed
             processed_this_run += 1
             label_counts.update(labels)
-            row = {"uri": post["uri"], "text": post["text"], "labels": labels, "thinking": thinking}
+            row = {"uri": post["uri"], "text": post["text"], "labels": labels}
             out_f.write(json.dumps(row) + "\n")
             out_f.flush()
             done_uris.add(post["uri"])

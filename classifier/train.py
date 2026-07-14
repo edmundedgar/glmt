@@ -44,14 +44,24 @@ def load_binary_labeled(path: Path) -> list[dict]:
 
 
 def load_freeform_labeled(path: Path, topic: str) -> list[dict]:
-    """(uri, text, labels: [...]) -- from consolidate_labels.py. Converts to
-    the same binary yes/no shape by checking membership of `topic`."""
+    """(uri, text, labels: [...]) -- from consolidate_labels.py, or from
+    local_llm_bulk_label.py's still-growing output. Converts to the same
+    binary yes/no shape by checking membership of `topic`. Tolerates a
+    truncated final line, since local_llm_bulk_label.py may be actively
+    appending to this file while we read it."""
     rows = []
     with open(path) as f:
-        for line in f:
+        lines = f.readlines()
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
             row = json.loads(line)
-            label = "yes" if topic in row["labels"] else "no"
-            rows.append({"uri": row["uri"], "text": row["text"], "label": label})
+        except json.JSONDecodeError:
+            continue
+        label = "yes" if topic in row["labels"] else "no"
+        rows.append({"uri": row["uri"], "text": row["text"], "label": label})
     return rows
 
 

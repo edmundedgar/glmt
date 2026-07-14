@@ -16,7 +16,7 @@ ExecStart=/usr/bin/autossh -M 0 -N \
   -o "ExitOnForwardFailure yes" \
   -o "StrictHostKeyChecking accept-new" \
   -R 127.0.0.1:14831:127.0.0.1:14831 \
-  gmlt@o1.edochan.com
+  glmt@o1.edochan.com
 
 Restart=always
 RestartSec=5

@@ -1,0 +1,9 @@
+{
+  "name": "labeler",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@skyware/labeler": "^0.2.0"
+  }
+}

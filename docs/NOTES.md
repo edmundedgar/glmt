@@ -4,11 +4,12 @@ Everything learned building this out, organized by component. Written so you (or
 
 ## Status vs. the spec
 
-Only **Component 1 (Ingester)** and a prototype of **Components 2/5 (Classifier + Training)** exist, as offline CLI scripts — not the live pipeline the spec describes.
+The full pipeline is live end-to-end — firehose to a real, publicly-queryable Bluesky labeler — but several pieces work differently than the spec originally sketched.
 
-- **Built:** Ingester (full, matches spec), `TopicClassifier` model + training/eval/benchmark scripts, three different label-generation approaches (Anthropic binary, Anthropic freeform+consolidation, local Ollama models), 8 trained topic heads.
-- **Not built:** Component 3 (Postgres Label DB), Component 4 (Labeler Server / `@skyware/labeler`), the live `asyncio.Queue` hookup between Ingester and a continuous Classifier Worker, the `/train` HTTP endpoint. Everything classifier-side currently reads from a flat `data/posts.jsonl` file in batch/offline mode, not from the ingester's queue in real time.
-- Training labels currently come from LLM-generated data (Anthropic API or local Ollama models), not the spec's user-submitted URI list — this was a deliberate detour to answer "can we bootstrap training data automatically" before building the `/train` endpoint's user-facing flow.
+- **Built:** Ingester (full, matches spec). `TopicClassifier` + `StackedTopicHeads` model, training/eval/benchmark scripts. Three label-generation approaches (Anthropic binary, Anthropic freeform+consolidation, local Ollama models) plus a resumable unattended bulk-labeling loop. 7 deployed topic heads (`uspol`, `sports`, `music`, `donald-trump`, `gaming`, `mental-health`, `technology`) — `death` is declared in the label taxonomy but has no trained head yet. A live classification pipeline (`classifier/live_export_labels.py`) that tails `posts.jsonl` continuously. A working labeler server (`labeler/server.mjs`, built on `@skyware/labeler`) that signs and serves real labels via `queryLabels`/`subscribeLabels`, publicly reachable at `label.goat.navy` through a dev-phase SSH-tunnel+nginx relay (see `deploy/`).
+- **Built differently than spec'd:** Component 3 (Label DB) isn't Postgres — `@skyware/labeler` owns its own SQLite (`labeler/labels.db`) with no external-DB hook, so the earlier prefix-table Postgres compaction design was never implemented (Postgres is installed on the box but unused). Component 4 (Labeler Server) is Node/TypeScript (`@skyware/labeler`), not the Python spec sketch — needed because of both the signing-algorithm mismatch (see below) and the lack of a callback-based DB integration point in the actual library. The Ingester→Classifier→Label-DB pipeline is poll-based (`live_export_labels.py` tails a file every 10s, `server.mjs` tails another file every 10s) rather than the spec's push-based `asyncio.Queue`.
+- **Not built:** the `/train` HTTP endpoint (training is CLI-only, `classifier/train.py`), language filtering.
+- Training labels come from LLM-generated data (Anthropic API and local Ollama models), not the spec's user-submitted URI list — a deliberate detour to answer "can we bootstrap training data automatically" before building the `/train` endpoint's user-facing flow.
 
 ---
 
@@ -46,7 +47,7 @@ Frozen encoder + `nn.ModuleDict` of one `nn.Linear(768, 1)` per topic, as specce
 | 1,000 | 2,465 | 1,931,481 |
 | 5,000 | 480 | 470,321 |
 
-`StackedTopicHeads` compiles many independently-trained `nn.Linear(768,1)` heads into one `nn.Linear(768, n_topics)` — mathematically identical output (diffs ~1e-7, pure floating point), just one matmul instead of N. **Training is unaffected** — keep training individual heads with `train.py` as usual; compile into the stacked form only for serving. Not yet wired into any live inference path; exists as a standalone module + benchmark.
+`StackedTopicHeads` compiles many independently-trained `nn.Linear(768,1)` heads into one `nn.Linear(768, n_topics)` — mathematically identical output (diffs ~1e-7, pure floating point), just one matmul instead of N. **Training is unaffected** — keep training individual heads with `train.py` as usual; compile into the stacked form only for serving. Wired into both `classifier/export_labels.py` and `classifier/live_export_labels.py`.
 
 ### Throughput headroom vs. the firehose
 
@@ -117,6 +118,24 @@ Supports two data sources via `--source binary` (yes/no + confidence, from `llm_
 - `nsfw` (221 positives, F1 0.639): likely too heterogeneous a category for a linear probe on this embedding space — "NSFW" covers wildly different content (text, described imagery, varying explicitness) that probably doesn't cluster into one clean region.
 - `anime` (162 positives, F1 0.491, barely above random): likely inconsistent *source* labeling — heavy overlap with neighboring freeform tags (`fandom`, `fan-art`, `japan`) means the freeform tagger itself probably applied `anime` inconsistently, muddying the training signal before the classifier ever sees it.
 
+### Retraining from `local_llm_bulk_labeled.jsonl` (local-model freeform tags, no consolidation pass)
+
+Once the local-model bulk-labeling run accumulated 6,159 rows, all 7 currently-deployed heads were retrained against it (same `--source freeform` path, just pointed at the local-model output instead of the Anthropic-consolidated one — the on-disk shape is identical by design):
+
+| Topic | Positives | F1 | vs. previous deployed F1 | Deployed? |
+|---|---|---|---|---|
+| uspol (`us-politics` tag) | 733 | 0.816 | 0.887 → 0.816 | ✅ (replaced) |
+| sports | 223 | 0.867 | 0.882 → 0.867 | ✅ (replaced) |
+| donald-trump | 117 | 0.826 | 0.845 → 0.826 | ✅ (replaced) |
+| music | 219 | 0.735 | 0.857 → 0.735 | ✅ (replaced) |
+| gaming | 268 | 0.744 | 0.798 → 0.744 | ✅ (replaced) |
+| mental-health | 137 | 0.564 | 0.792 → *unchanged* | ❌ below threshold, old head kept |
+| technology | 208 | 0.686 | 0.762 → *unchanged* | ❌ below threshold, old head kept |
+
+Note the F1s here are mostly slightly *lower* than the Anthropic-consolidated versions they replaced — this data hasn't been through a consolidation pass (raw freeform tags straight from the local model, e.g. `politics` and `us-politics` both appear as separate uncombined tags), and the local model itself is a smaller/less careful tagger than Claude. The point of retraining on it isn't "better than the Anthropic data" — it's that this dataset keeps growing for free from idle GPU time, so it's the practical way to keep improving heads (especially the two that never had enough Anthropic-sourced positives to clear 0.7 at all) without spending more API budget. `mental-health` and `technology` didn't clear the deploy bar this round, most likely simply on data volume (137/208 positives vs. 700+ for `uspol`) — worth retrying once the accumulator grows further.
+
+Previous deployed weights should be backed up before any promotion (`cp classifier/weights/*.pt classifier/weights_backup_<name>/`) — check there if a retrain regresses something in practice despite passing the F1 gate. **Get the target directory name right**: a `mkdir classifier/weights_backup_X` followed by `cp ... classifier/weights_backup_Y/` (mismatched name, e.g. from a shell `$(date ...)` substitution not matching a hardcoded fallback string) fails silently if stderr is redirected to `/dev/null` — this happened once here, and the "backup" was actually empty when the real thing was needed. The original Anthropic-trained weights for the 5 replaced topics were recovered by simply retraining from `data/freeform_labels_full_consolidated.jsonl` again — `train.py` is fully deterministic (`SEED = 0`, `torch.manual_seed(SEED)`), and the reproduced F1s matched the original table exactly (0.887/0.882/0.857/0.845/0.798). They now live in `classifier/weights_backup_original_anthropic/` (gitignored, matches `classifier/weights_backup*/`). **Verify a backup actually landed files** (`ls` it) before trusting it, and don't rely on `2>/dev/null` to hide errors from a step whose success you actually care about.
+
 ---
 
 ## Local model experiments (Ollama)
@@ -133,15 +152,13 @@ Supports two data sources via `--source binary` (yes/no + confidence, from `llm_
 
 The abliterated 14B model is fast (~0.95s/post) but badly miscalibrated for careful binary judgment: on a 300-post `uspol` comparison against Claude's labels, **recall=1.000 but precision=0.229** (F1 0.372) — it says "yes" on almost everything, including emoji spam and unrelated small talk, sometimes even while self-reporting *low* confidence (0.20-0.30) for that same "yes." Swapping to the standard (non-abliterated) `qwen3:14b` on the same task: **96.7% agreement with Claude, F1 0.750** — dramatically better, at the cost of being ~10x slower (9.24s/post vs 0.95s/post). Conclusion: the abliteration (refusal-removal fine-tuning) itself degrades judgment quality on this kind of task; it's not that "small local models can't classify."
 
-### Ollama structured output silently disables thinking, regardless of `/no_think`
+### Use Ollama's native `think` API field, not the `/no_think` prompt convention — the latter is unreliable
 
-Important and non-obvious: passing Ollama's `format` parameter (JSON schema, used for reliable structured output) triggers **grammar-constrained decoding**, which forces the very first generated token to conform to the schema. This leaves no room for a `<think>...</think>` preamble — **thinking gets suppressed by `format` alone**, whether or not you also append the Qwen3 `/no_think` convention. Confirmed empirically: with `format` set, `eval_count` stayed ~16 tokens whether `/no_think` was appended or not; dropping `format` entirely let `eval_count` jump to ~180-500+ tokens and exposed a genuine separate `message.thinking` field in Ollama's response.
+**Superseded finding, kept for the record:** an early test suggested passing Ollama's `format` parameter (JSON schema) alone reliably suppressed thinking via grammar-constrained decoding, regardless of whether `/no_think` was also appended to the prompt (`eval_count` stayed ~16 tokens either way in that test). **This did not hold up under sustained real-world use.** Once `local_llm_bulk_label.py` ran unattended over hundreds of posts, the *exact same* request shape (format set, `/no_think` in the prompt) sometimes produced a full thinking trace anyway (3000+ chars, 40-50x slower) and sometimes didn't — same code, non-deterministic outcome. `/no_think` is a text convention the model can probabilistically ignore; it was never a hard constraint, the small early sample just didn't happen to surface a miss.
 
-To actually test thinking-enabled behavior, you have to drop `format` and parse the model's natural output instead — and note the model then follows the prompt's literal phrasing rather than a fixed schema shape (asked for "an array", got a bare `[...]`, not the `{"labels": [...]}` object the schema would have forced). `classifier/local_llm_topic_list_label.py`'s `extract_labels()` tries the array form first, falls back to an object with a `labels` key.
+**Fix:** use Ollama's `"think": false` request field instead — a real API-level control, not a prompt hint. Verified reliable across many repeated calls (~0.85-1.5s/post, zero thinking every time, no variance). `classifier/local_llm_topic_list_label.py`'s `classify()` now sends `"think": not no_think` directly; there's no longer a need for a "parse thinking out of free text" fallback path, since `format` + `think` work cleanly together regardless of which way `think` is set (thinking-enabled responses expose it in a separate `message.thinking` field, not interleaved with the structured `content`).
 
-**Practical upshot for this task specifically:** thinking-enabled vs. `/no_think` made no meaningful difference. Row-by-row on 15 identical posts: 86.7% exact agreement, and the 2 disagreements were the hardest/most ambiguous posts in the sample with defensible calls in *both* directions (not one mode being systematically better). Wall-clock was also nearly identical (11.92s vs 11.67s/post) despite ~20-30x more tokens generated when thinking — there's a large fixed per-request latency component (~9-12s) on this setup that isn't explained by `load_duration + prompt_eval_duration + eval_duration` in Ollama's own response timing fields; never fully diagnosed (ruled out: stuck/orphaned processes, checked via `ollama stop` + fresh reload, latency persisted). If picking this up again, worth `llama-server`-level profiling rather than trusting Ollama's reported duration breakdown.
-
-**Decision made:** stick with `/no_think` + `format` schema — same quality, and it's the faster/simpler code path (structured output is easier to parse reliably than free text).
+**Practical upshot for this task specifically:** thinking-enabled vs. non-thinking made no meaningful difference to label quality on a small side-by-side (both modes got the two hardest/most ambiguous posts "wrong" in defensible-either-way fashion, nothing systematic). Given that, and that non-thinking is both faster and immune to the reliability problem above, non-thinking is the default (`--no-think` defaults to `True`).
 
 ### Closed-list multi-label: topic list size is a real speed/coverage tradeoff
 
@@ -181,7 +198,46 @@ Built for "leave it running whenever the GPU is idle, interrupt freely." Verifie
 
 The mechanism: open the output file once, `write()` + `flush()` after every single completed row (never buffer multiple rows before writing), and build the "already done" skip-set from the output file's own contents by URI on startup. Also hardened `load_already_labeled_uris()` to skip (not crash on) a malformed/truncated final line, as belt-and-suspenders — never actually triggered in testing since the flush-per-row pattern already made corruption practically impossible, but cheap to have.
 
-As of this writing, only 8 posts have accumulated in `data/local_llm_bulk_labeled.jsonl` — this needs a real long run before it's useful training data (compare to the 500-700+ positives needed per the training section above).
+As of this writing, `data/local_llm_bulk_labeled.jsonl` has grown to 6,000+ rows from unattended runs and is already being used to retrain deployed heads (see updated results table above) — the "needs a real long run" concern from early testing is resolved.
+
+### Ollama `--context-shift` + no `num_predict` cap = a request that can hang forever
+
+Found the hard way: a bulk-labeling run silently stalled for 45+ minutes — process still alive, GPU still at 100%, but the output file stopped growing entirely. The Ollama server here is launched with `--context-shift`, which lets generation keep going past `num_ctx` by dropping old tokens instead of stopping, and the client-side request had no `num_predict` cap and no timeout — so a single post that triggered a degenerate repetition loop in the model had nothing to stop it. `resp.read()`/`urlopen()` just blocked indefinitely waiting for a response that was never going to finish.
+
+**Fix:** `classify()` now sets `"num_predict": 512` in the request options (real JSON label output for this schema never comes close — a full 30-topic array is under ~150 tokens) and passes `timeout=60` to `urlopen()`. Belt-and-suspenders: the cap should make runaway generations impossible, the timeout catches it anyway if something still goes long, and the caller (`local_llm_bulk_label.py`'s per-post `try/except`) already treats a failure as "log and skip this post," so hitting either safeguard degrades to a missed post rather than a hung pipeline. Confirmed benign in practice — after the fix, resuming a run produced 1 truncated-JSON error in the first 30 posts (an unusually verbose generation hitting the cap), everything else processed normally at the usual ~1.2-1.6s/post.
+
+---
+
+## Labeler server (`labeler/`)
+
+### Why a bsky account is needed at all
+
+The base AT Protocol doesn't require a labeler to have a bsky account — but `app.bsky.labeler.service` (the record declaring "this DID is a labeler, here's its endpoint and label taxonomy") is a normal PDS-backed repo record, and a DID needs a PDS to host any repo record at all. A regular bsky account is the easy way to get a DID with a working PDS, so the labeler ended up being a real (if second) bsky account. It migrates cleanly like any other did:plc account if the labeler ever needs to move PDS/host.
+
+### Signing: secp256k1, not Ed25519 (spec was wrong)
+
+The spec's pseudocode assumed Ed25519. Confirmed via `@skyware/labeler`'s actual source (`util/crypto.js`: `k256Sign` — SHA-256 hash of the dag-cbor-encoded label, signed with secp256k1, `lowS: true`) and independently cross-checked against Bluesky's Go reference implementation (`indigo`'s `atcrypto` package), which also only supports secp256k1/p256 for repo signing — no Ed25519 anywhere in the stack.
+
+### Two separate signing keys live on the same DID document — don't confuse them
+
+A labeler account's did:plc document has **two** `verificationMethod` entries: `#atproto` (the account's normal PDS/repo commit-signing key — every bsky account has this) and `#atproto_label` (a dedicated key just for signing labels, set up separately via `plcSetupLabeler`/`npx @skyware/labeler setup`). `LABELLER_SIGNING_KEY` in `.env` corresponds to `#atproto_label`, **not** `#atproto`. Comparing a derived pubkey against the wrong one of these looks exactly like a real key mismatch (different multibase strings) but isn't — cost some real back-and-forth before catching the mixup. `labeler/verify-signing-key.mjs` checks the right one (`#atproto_label`) and also verifies a real signature from a live `queryLabels` response end-to-end (derives pubkey from `.env` → dag-cbor-encodes the exact label shape `@skyware/labeler` signs, `{src, uri, val, cts, neg, ver}` — notably *not* including the `id` field, which is a storage-assigned autoincrement added after signing — → checks the ECDSA signature).
+
+### `subscribeLabels` is a real WebSocket, not SSE (spec was wrong here too)
+
+Confirmed both from `@skyware/labeler`'s type signature (`SubscriptionHandler = WebsocketHandler<...>`) and empirically (`curl` gets back `HTTP/1.1 101 Switching Protocols` with binary DAG-CBOR frames). This mattered for the nginx relay config (`deploy/nginx-label.goat.navy.conf`) — a config tuned for SSE (`proxy_set_header Connection '';`) actively strips the `Upgrade`/`Connection` headers a WebSocket handshake needs, breaking `subscribeLabels` outright. Fixed with the standard `map $http_upgrade $connection_upgrade { default upgrade; '' close; }` pattern, which lets one location block correctly handle both plain HTTP (`queryLabels`) and the WS upgrade (`subscribeLabels`).
+
+### `@skyware/labeler` owns its own storage — no external DB hookup
+
+The spec's pseudocode imagined a callback-based `queryLabels` handler backed by our own Postgres schema. The actual library doesn't support this: `LabelerServer` owns a SQLite database directly (via `@libsql/client`, `dbPath`/`dbUrl`+`dbToken`) and labels go in via its own `createLabel`/`createLabels` instance methods — there's no pluggable storage interface. This is why `labeler/server.mjs` is a thin polling adapter (tail `pending-labels.jsonl`, call `createLabels`) rather than a real DB writer, and why the earlier prefix-table Postgres compaction design (numeric user-ID + rkey-as-timestamp compaction, discussed for the "100-1000x more users than posts" scaling case) was never implemented — Postgres is installed on the box per that discussion but currently unused.
+
+### Two unbounded-growth OOM bugs, same root cause, same fix pattern
+
+Both `labeler/server.mjs` and `classifier/live_export_labels.py` are long-running loops that poll an ever-growing append-only file (`pending-labels.jsonl`, `posts.jsonl`) for new rows. Both were originally written to **re-read and re-parse the entire file every poll cycle** — fine at first, but cost grows with the file, and eventually:
+
+- `server.mjs` OOM-crashed (`JavaScript heap out of memory`, SIGABRT) after the pending-labels file grew to ~92.5MB / 743K lines from a large catch-up burst.
+- `live_export_labels.py` was caught before it crashed (proactively stopped once it hit ~3.7GB RSS and climbing) — a second unattended multi-hour ingester run had grown `posts.jsonl` to 4.5M lines, and the read-everything-per-cycle pattern was about to hold ~3.4M posts in memory at once.
+
+**Fix, same shape in both:** track how much of the file has already been consumed (`server.mjs`: a byte offset via `fs.promises.open` + positional `read()`, persisted to `.ingest-offset` so a crash doesn't lose progress; `live_export_labels.py`: a line-count cursor, same pattern as the ingester's own cursor) and only process what's newly appended, with a hard per-cycle cap (`live_export_labels.py`: `MAX_LINES_PER_CYCLE = 5000`) so even a huge backlog gets worked off incrementally instead of as one unbounded batch. **General lesson for this codebase:** any loop that repeatedly reads a file which is *also* being appended to by another process needs bounded/incremental reads from the start — this bit us twice with the identical shape, worth checking for a third time before it happens again.
 
 ---
 
@@ -205,12 +261,13 @@ Everything in `data/` is generated, not source-controlled. Key files, in rough p
 
 ## Open questions / natural next steps
 
-Carried over from the spec's own list, plus what we've since learned:
+**Closed since the last pass** (kept here briefly for continuity, drop this line entirely on the next cleanup): live pipeline is wired (poll-based, not push-based — see "Labeler server" above); Components 3 & 4 exist in modified form; `StackedTopicHeads` is wired into both `export_labels.py` and `live_export_labels.py`; `local_llm_bulk_labeled.jsonl` has real volume now (6,000+ rows, growing) and has already been used for a retrain.
+
+Still open:
 
 - **Language filtering** — the spec flags this as needed (base model is English-only); we saw concrete non-English mislabeling in early exploration. Not implemented in the ingester (`commit.record.langs` is available but unused).
-- **Wire the live pipeline** — Ingester → `asyncio.Queue` → Classifier Worker → Label DB, per the spec, doesn't exist yet. Current classifier work is entirely offline/batch against `posts.jsonl`.
-- **Components 3 & 4** (Postgres Label DB, `@skyware/labeler` TypeScript server) — not started.
-- **Wire `StackedTopicHeads` into a real serving path** — built and benchmarked standalone, not yet used by any inference script.
-- **Grow `local_llm_bulk_labeled.jsonl`** — only 8 rows so far; needs a real unattended run (hours, whenever the GPU is free) before it's useful for retraining anything.
-- **Storage optimization** — still deferred per spec, unaddressed.
+- **`mental-health` and `technology` heads need more data** — didn't clear the F1 > 0.7 deploy bar on the local-model retrain (137 and 208 positives respectively); worth retrying once `local_llm_bulk_labeled.jsonl` grows further, or once that data goes through a consolidation pass like the Anthropic freeform data did.
+- **Storage optimization / the Postgres compaction design** — moot for now since `@skyware/labeler` owns its own SQLite with no external-DB hook, but would become relevant again if the labeler server is ever swapped out or made to read from an independent Label DB.
 - **The Jetstream v1→v2 migration** — re-check the live endpoint's protocol if this project sits untouched for a while; the upstream rewrite was clearly mid-flight when this was built.
+- **Push-based live pipeline** — current pipeline is polling at every stage (10s intervals in both `live_export_labels.py` and `server.mjs`), which works but adds up to ~20s worst-case latency from post ingestion to label availability. Not a problem yet; would matter if latency requirements tighten.
+- **`num_predict`/timeout guards against Ollama hangs are a mitigation, not a guarantee** — they bound the damage from a runaway generation but don't explain *why* `--context-shift` + a particular post triggers one; if bulk-labeling stalls again, check for the same symptom (process alive, GPU busy, output file static) before assuming something new.
